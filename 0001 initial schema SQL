@@ -1,0 +1,286 @@
+-- The Foxverse Core Database
+-- Migration 0001: initial schema
+-- Target: PostgreSQL 15+ (works on Supabase)
+-- Standard: engineering/standards/DATABASE_STANDARD.md
+
+begin;
+
+-- ---------------------------------------------------------------
+-- Enumerated types
+-- ---------------------------------------------------------------
+create type organization_status as enum ('prospect', 'active', 'suspended', 'closed');
+create type product_status      as enum ('draft', 'active', 'retired');
+create type license_model       as enum ('subscription', 'perpetual', 'per_deployment');
+create type license_status      as enum ('trial', 'active', 'suspended', 'expired', 'revoked');
+create type environment_type    as enum ('production', 'staging', 'development');
+create type deployment_status   as enum ('planned', 'live', 'offline', 'decommissioned');
+create type work_status         as enum ('requested', 'quoted', 'approved', 'in_progress', 'delivered', 'cancelled');
+create type invoice_status      as enum ('draft', 'issued', 'paid', 'overdue', 'void');
+create type ticket_status       as enum ('open', 'in_progress', 'waiting_on_client', 'resolved', 'closed');
+create type ticket_priority     as enum ('low', 'normal', 'high', 'urgent');
+
+-- ---------------------------------------------------------------
+-- Shared trigger: keep updated_at current
+-- ---------------------------------------------------------------
+create function set_updated_at() returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+-- ---------------------------------------------------------------
+-- Clients (the tenants)
+-- ---------------------------------------------------------------
+create table organizations (
+  id               uuid primary key default gen_random_uuid(),
+  name             text not null,
+  legal_name       text,
+  country_code     char(2),
+  industry         text,
+  default_language text not null default 'ar' check (default_language in ('ar', 'en')),
+  status           organization_status not null default 'prospect',
+  notes            text,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  deleted_at       timestamptz
+);
+
+create table contacts (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references organizations(id),
+  full_name       text not null,
+  email           text,
+  phone           text,
+  job_title       text,
+  is_primary      boolean not null default false,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now(),
+  deleted_at      timestamptz
+);
+create index idx_contacts_organization_id on contacts(organization_id);
+create unique index uq_contacts_one_primary
+  on contacts(organization_id) where is_primary and deleted_at is null;
+
+-- ---------------------------------------------------------------
+-- Product catalog
+-- ---------------------------------------------------------------
+create table products (
+  id          uuid primary key default gen_random_uuid(),
+  code        text not null unique check (code ~ '^[a-z0-9-]+$'),
+  name        text not null,
+  summary     text,
+  status      product_status not null default 'draft',
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  deleted_at  timestamptz
+);
+
+create table product_versions (
+  id          uuid primary key default gen_random_uuid(),
+  product_id  uuid not null references products(id),
+  version     text not null,
+  release_notes text,
+  released_at timestamptz,
+  is_supported boolean not null default true,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  unique (product_id, version)
+);
+create index idx_product_versions_product_id on product_versions(product_id);
+
+create table plans (
+  id              uuid primary key default gen_random_uuid(),
+  product_id      uuid not null references products(id),
+  code            text not null check (code ~ '^[a-z0-9-]+$'),
+  name            text not null,
+  model           license_model not null,
+  billing_interval text check (billing_interval in ('month', 'year')),
+  price_minor     bigint not null check (price_minor >= 0),
+  currency        char(3) not null default 'USD',
+  white_label     boolean not null default false,
+  limits          jsonb not null default '{}'::jsonb,
+  is_active       boolean not null default true,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now(),
+  unique (product_id, code),
+  check ((model = 'subscription') = (billing_interval is not null))
+);
+create index idx_plans_product_id on plans(product_id);
+
+-- ---------------------------------------------------------------
+-- Licensing: who may use which product, and where it runs
+-- ---------------------------------------------------------------
+create table licenses (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references organizations(id),
+  product_id      uuid not null references products(id),
+  plan_id         uuid not null references plans(id),
+  license_key     text not null unique,
+  status          license_status not null default 'trial',
+  starts_at       timestamptz not null default now(),
+  expires_at      timestamptz,
+  seats           integer check (seats is null or seats > 0),
+  white_label     boolean not null default false,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now(),
+  deleted_at      timestamptz,
+  check (expires_at is null or expires_at > starts_at)
+);
+create index idx_licenses_organization_id on licenses(organization_id);
+create index idx_licenses_product_id on licenses(product_id);
+create index idx_licenses_plan_id on licenses(plan_id);
+create index idx_licenses_status_expires_at on licenses(status, expires_at);
+
+create table deployments (
+  id                 uuid primary key default gen_random_uuid(),
+  organization_id    uuid not null references organizations(id),
+  license_id         uuid not null references licenses(id),
+  product_version_id uuid references product_versions(id),
+  environment        environment_type not null default 'production',
+  url                text,
+  status             deployment_status not null default 'planned',
+  deployed_at        timestamptz,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+create index idx_deployments_organization_id on deployments(organization_id);
+create index idx_deployments_license_id on deployments(license_id);
+create index idx_deployments_product_version_id on deployments(product_version_id);
+
+-- ---------------------------------------------------------------
+-- Customization work (billed separately from the license)
+-- ---------------------------------------------------------------
+create table customizations (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references organizations(id),
+  license_id      uuid not null references licenses(id),
+  title           text not null,
+  description     text,
+  status          work_status not null default 'requested',
+  price_minor     bigint check (price_minor is null or price_minor >= 0),
+  currency        char(3) not null default 'USD',
+  requested_at    timestamptz not null default now(),
+  delivered_at    timestamptz,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+create index idx_customizations_organization_id on customizations(organization_id);
+create index idx_customizations_license_id on customizations(license_id);
+
+-- ---------------------------------------------------------------
+-- Billing
+-- ---------------------------------------------------------------
+create table invoices (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references organizations(id),
+  number          text not null unique,
+  status          invoice_status not null default 'draft',
+  currency        char(3) not null default 'USD',
+  total_minor     bigint not null default 0 check (total_minor >= 0),
+  issued_at       timestamptz,
+  due_at          timestamptz,
+  paid_at         timestamptz,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+create index idx_invoices_organization_id on invoices(organization_id);
+create index idx_invoices_status_due_at on invoices(status, due_at);
+
+create table invoice_items (
+  id               uuid primary key default gen_random_uuid(),
+  invoice_id       uuid not null references invoices(id),
+  license_id       uuid references licenses(id),
+  customization_id uuid references customizations(id),
+  description      text not null,
+  quantity         integer not null default 1 check (quantity > 0),
+  unit_price_minor bigint not null check (unit_price_minor >= 0),
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  check (not (license_id is not null and customization_id is not null))
+);
+create index idx_invoice_items_invoice_id on invoice_items(invoice_id);
+create index idx_invoice_items_license_id on invoice_items(license_id);
+create index idx_invoice_items_customization_id on invoice_items(customization_id);
+
+create table payments (
+  id           uuid primary key default gen_random_uuid(),
+  invoice_id   uuid not null references invoices(id),
+  amount_minor bigint not null check (amount_minor > 0),
+  currency     char(3) not null default 'USD',
+  method       text,
+  reference    text,
+  paid_at      timestamptz not null default now(),
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+create index idx_payments_invoice_id on payments(invoice_id);
+
+-- ---------------------------------------------------------------
+-- Support
+-- ---------------------------------------------------------------
+create table support_tickets (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references organizations(id),
+  license_id      uuid references licenses(id),
+  contact_id      uuid references contacts(id),
+  subject         text not null,
+  body            text,
+  status          ticket_status not null default 'open',
+  priority        ticket_priority not null default 'normal',
+  resolved_at     timestamptz,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+create index idx_support_tickets_organization_id on support_tickets(organization_id);
+create index idx_support_tickets_license_id on support_tickets(license_id);
+create index idx_support_tickets_contact_id on support_tickets(contact_id);
+create index idx_support_tickets_status_priority on support_tickets(status, priority);
+
+-- ---------------------------------------------------------------
+-- Audit log (append-only record of important changes)
+-- ---------------------------------------------------------------
+create table audit_logs (
+  id          uuid primary key default gen_random_uuid(),
+  actor       text,
+  action      text not null,
+  entity_type text not null,
+  entity_id   uuid,
+  changes     jsonb,
+  created_at  timestamptz not null default now()
+);
+create index idx_audit_logs_entity on audit_logs(entity_type, entity_id);
+create index idx_audit_logs_created_at on audit_logs(created_at);
+
+-- ---------------------------------------------------------------
+-- updated_at triggers on every table that has the column
+-- ---------------------------------------------------------------
+do $$
+declare t text;
+begin
+  for t in
+    select table_name from information_schema.columns
+    where table_schema = 'public' and column_name = 'updated_at'
+  loop
+    execute format(
+      'create trigger trg_%I_updated_at before update on %I
+       for each row execute function set_updated_at()', t, t);
+  end loop;
+end $$;
+
+-- ---------------------------------------------------------------
+-- Security: row level security ON for every table, no public access.
+-- With no policies, only the service role (your backend) can read/write.
+-- Add explicit policies later for each role that needs access.
+-- ---------------------------------------------------------------
+do $$
+declare t text;
+begin
+  for t in
+    select tablename from pg_tables where schemaname = 'public'
+  loop
+    execute format('alter table %I enable row level security', t);
+  end loop;
+end $$;
+
+commit;
