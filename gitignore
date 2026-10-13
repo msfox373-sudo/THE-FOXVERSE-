@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# Dependencies and builds
+node_modules/
+dist/
+build/
+.next/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
